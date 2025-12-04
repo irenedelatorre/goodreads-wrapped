@@ -1,0 +1,5 @@
+"0","# Load function to normalize columns"
+"0","source(""R/01_normalize_cols.R"")"
+"0",""
+"0","# scrape_shelf_table ROBUST (auto-detection + wait + debug)"
+"0","source(""R/02_scrape_progress_per_book.R"")"

@@ -1,0 +1,28 @@
+{
+    "id": "ED601C1D",
+    "path": null,
+    "project_path": null,
+    "type": "object_explorer",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1764873077126.0,
+    "source_on_save": false,
+    "relative_order": 8,
+    "properties": {
+        "id": "c79673e4f3af47dd9ab0c93b7c6aa2e1",
+        "name": "res2",
+        "title": "res2",
+        "language": "R",
+        "source_window_id": "",
+        "Source": "Source"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 0,
+    "encoding": "",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1764873077126,
+    "read_only": false,
+    "read_only_alternatives": []
+}

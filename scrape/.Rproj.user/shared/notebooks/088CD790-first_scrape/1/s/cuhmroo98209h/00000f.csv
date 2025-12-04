@@ -1,0 +1,11 @@
+"0","outfile <- file.path("
+"0","  getwd(),"
+"0","  sprintf("
+"0","    ""output/goodreads_with_dates_%s.csv"","
+"0","    format(Sys.Date(), ""%Y%m%d"")"
+"0","    ))"
+"0","write_csv(final_df, outfile)"
+"0","message(sprintf(""\n✅ ¡Listo! Exportado a: %s"", outfile))"
+"2","
+✅ ¡Listo! Exportado a: /Users/irene.arenas/Documents/Personal/reading_list/Reading list/output/goodreads_with_dates_20251204.csv
+"

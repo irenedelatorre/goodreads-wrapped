@@ -1,0 +1,21 @@
+"0","message("">> Scrapping read books"")"
+"2",">> Scrapping read books
+"
+"0","df_read <- scrape_shelf_table(""read"")"
+"2",".. [read p.1] selector='tr.bookalike.review' rows=100
+"
+"2",".. [read p.2] selector='tr.bookalike.review' rows=100
+"
+"2",".. [read p.3] selector='tr.bookalike.review' rows=61
+"
+"0","message("">> Finished scrapping"")"
+"2",">> Finished scrapping
+"
+"0","# get reading or waiting to be read books too"
+"0",""
+"0","# message("">> Raspando 'currently-reading' (en lectura)..."")"
+"0","# df_current <- scrape_shelf_table(""currently-reading"")"
+"0","# "
+"0","# message("">> Raspando 'to-read' (por leer)..."")"
+"0","# df_toread  <- scrape_shelf_table(""to-read"")"
+"0",""

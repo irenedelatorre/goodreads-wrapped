@@ -1,0 +1,20 @@
+"0","current_tbls <- lapply(shelves_to_check, function(sh) {"
+"0","  message("">> Scraping shelf table: "", sh)"
+"0","  scrape_shelf_table(sh, max_pages = 50, sleep_sec = 1)"
+"0","})"
+"2",">> Scraping shelf table: read
+"
+"2",".. [read p.1] selector='tr.bookalike.review' rows=100
+"
+"2",".. [read p.2] selector='tr.bookalike.review' rows=100
+"
+"2",".. [read p.3] selector='tr.bookalike.review' rows=61
+"
+"0","current <- bind_rows(current_tbls)"
+"0",""
+"0","current <- current %>%"
+"0","  mutate(review_id = extract_review_id(view)) %>%"
+"0","  filter(!is.na(review_id)) %>%"
+"0","  distinct(review_id, .keep_all = TRUE)"
+"0",""
+"0",""

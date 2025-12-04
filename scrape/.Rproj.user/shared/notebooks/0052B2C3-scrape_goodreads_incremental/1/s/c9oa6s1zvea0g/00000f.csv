@@ -1,0 +1,5 @@
+"0","if (!""review_id"" %in% names(old) && ""view"" %in% names(old)) {"
+"0","  old <- old %>%"
+"0","    mutate(review_id = extract_review_id(view))"
+"0","}"
+"0",""

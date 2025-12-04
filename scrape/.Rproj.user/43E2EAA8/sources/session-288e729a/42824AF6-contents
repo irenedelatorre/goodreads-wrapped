@@ -1,0 +1,508 @@
+---
+title: "Scrape Goodreads (incremental - update file)"
+author: "Irene de la Torre Arenas"
+date: "2025-09-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R script that extracts your Goodreads library
+
+Script created using ChatGPT.
+
+Script that extract your Goodreads library 
+including “Date started” and “Date finished” from your “My Books” view (not
+from the official CSV), while logged in. It uses RSelenium to open a real
+Firefox browser so you can log in (even if your library is not public).
+
+### How it works:
+
+1) Opens Firefox with RSelenium
+2) Navigates to Goodreads so you can log in
+3) Iterates through your shelves (“read”, “currently-reading”, and “to-read”) in
+table view with per_page=100, scrapes the visible table (which usually includes
+“Date Started” and “Date Read/Finished” if you have them saved)
+4) Combines everything and exports a CSV with title, author, date_started,
+date_finished, etc.
+
+Prerequisites (one time):
+Make sure you have Firefox installed. If RSelenium fails to start due to
+version mismatches, check the comment inside the script.
+
+```{r}
+# install.packages(c(
+#   "RSelenium",
+#   "rvest",
+#   "xml2",
+#   "dplyr",
+#   "purrr",
+#   "stringr",
+#   "readr",
+#   "lubridate",
+#   "tidyr",
+#   "binman",
+#   "wdman"
+#   ))
+
+suppressPackageStartupMessages({
+  library(RSelenium)
+  library(rvest)
+  library(xml2)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(readr)
+  library(tidyr)
+  library(jsonlite)
+  library(tibble)
+  library(lubridate)
+})
+
+```
+
+## 0) Set up functions
+To avoid errors if the session is already closed.
+
+```{r}
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+safe_onexit <- function(expr) {
+  try(expr, silent = TRUE)
+}
+
+#Source scraping helpers (functions)
+# Loads function to normalize columns:
+# - `normalize_cols`
+# - `scrape_shelf_table`
+# - `parse_rating`
+# - `parse_gd_date`
+
+source("R/01_normalize_cols.R")
+
+# scrape_shelf_table ROBUST (auto-detection + wait + debug)
+# loads the following functions:
+# - `null_or_num`
+# - `null_or_str`
+# - `scrape_reading_progress`
+# - `format_progress_json`
+source("R/02_scrape_progress_per_book.R")
+
+# source metadata scraper
+# loads the following functions:
+# - clean_invisibles
+# - .lang_candidate_ok
+# - .extract_language
+# - scrape_book_metadata
+# - safe_metadata
+# - get_meta_cached
+source("R/03_scrape_book_metadata.R")
+```
+
+### Paths and settings
+```{r}
+# Master file produced previously. Prefer one that includes `view` (review URL)
+# and/or a `review_id` column.
+master_path <- "output/goodreads_progress_logs.csv"
+
+# Books-per-page when scraping the shelves table
+n_books <- 100
+
+# Which shelves to refresh minimally
+# (usually just "read", optionally "currently-reading")
+shelves_to_check <- c("read") 
+
+```
+
+## 1) Start Selenium (Firefox)
+
+```{r}
+
+message(">> Starting Selenium (Firefox)...")
+port <- as.integer(4572)
+
+rD <- rsDriver(
+  browser    = "firefox",
+  geckover   = "latest",
+  phantomver = NULL,
+  check      = FALSE,
+  verbose    = FALSE,
+  port       = port
+)
+remDr <- rD$client
+remDr$open()
+
+on.exit({
+  message("\n>> Closing session and Selenium server...")
+  safe_onexit(remDr$close())
+  safe_onexit(rD$server$stop())
+}, add = TRUE)
+
+go <- function(u) {
+  stopifnot(is.character(u), length(u) == 1L, !is.na(u), nzchar(trimws(u)))
+  remDr$navigate(trimws(u))
+}
+
+retry_nav <- function(u, attempts = 3, wait = 2) {
+  for (i in seq_len(attempts)) {
+    ok <- try({ go(u); TRUE }, silent = TRUE)
+    if (isTRUE(ok)) return(invisible(TRUE))
+    Sys.sleep(wait)
+  }
+  stop("Could not navigate to: ", u)
+}
+
+```
+
+## 2) Login manual
+
+```{r}
+
+login_url <- "https://www.goodreads.com/user/sign_in"
+n_books <- 100 #number of books in each page
+mybooks_url <- paste0(
+  "https://www.goodreads.com/review/list?view=table&per_page=",
+  n_books,
+  "&shelf=all"
+)
+
+retry_nav(login_url)
+```
+
+Log in to Goodreads in the Firefox window (username/password or SSO). 
+Once you’re logged in, the script will automatically detect it...
+
+```{r}
+
+wait_until_logged_in <- function(timeout = 300, poll = 3) {
+  t0 <- Sys.time()
+  repeat {
+    retry_nav(mybooks_url)
+    Sys.sleep(2)
+    curr <- try(remDr$getCurrentUrl()[[1]], silent = TRUE)
+    not_signin <- if (!inherits(curr, "try-error"))
+      !grepl("sign_in", curr, fixed = TRUE) else FALSE
+    src <- try(remDr$getPageSource()[[1]], silent = TRUE)
+    has_table <- FALSE
+    if (!inherits(src, "try-error")) {
+      html <- xml2::read_html(src)
+      has_table <- length(rvest::html_elements(html, "table")) > 0
+    }
+    if (isTRUE(not_signin) && isTRUE(has_table)) {
+      message("✔️ Login detected. Continuing.")
+      break
+    }
+    if (as.numeric(difftime(Sys.time(), t0, units = "secs")) > timeout) {
+      stop("Login was not detected within ", timeout, " s.")
+    }
+    Sys.sleep(poll)
+  }
+}
+wait_until_logged_in()
+Sys.sleep(2)
+
+```
+
+## 3) Load existing master file & ensure stable key
+
+```{r}
+if (!file.exists(master_path)) {
+  stop("Master file not found: ", master_path,
+       "\nRun the full scraper once before using the updater.")
+}
+
+old <- readr::read_csv(master_path, show_col_types = FALSE)
+```
+
+Helper: extract review_id from `view` URLs like ".../review/show/7443061737"
+
+```{r}
+extract_review_id <- function(x) {
+  id <- stringr::str_extract(x %||% "", "(?<=/review/show/)\\d+")
+  suppressWarnings(as.character(id))
+}
+```
+
+If `review_id` is missing, try to derive from `view` (if available)
+
+```{r}
+if (!"review_id" %in% names(old) && "view" %in% names(old)) {
+  old <- old %>%
+    mutate(review_id = extract_review_id(view))
+}
+
+```
+
+If neither `review_id` nor `view` exist in the old file,
+do a quick shelf scrape to rebuild them and join.
+
+```{r}
+
+need_key <- !"review_id" %in% names(old) || all(is.na(old$review_id))
+
+if (need_key) {
+  message("Old file lacks review_id. Doing a quick shelf scrape to rebuild keys...")
+  quick <- scrape_shelf_table("read", max_pages = 50, sleep_sec = 1)
+  quick_keys <- quick %>%
+    transmute(
+      title,
+      book_url,
+      view,
+      review_id = extract_review_id(view)
+    )
+  # Join using (book_url, title) as a conservative heuristic key.
+  # Adjust if you keep a better unique key.
+  old <- old %>%
+    left_join(quick_keys, by = c("book_url", "title")) 
+  # %>%
+  #   mutate(review_id = coalesce(review_id.x, review_id.y)) %>%
+  #   select(-review_id.x, -review_id.y)
+}
+
+if (!"review_id" %in% names(old) || all(is.na(old$review_id))) {
+  stop("Could not infer review_id for existing rows. ",
+       "Consider re-exporting master with `view`/`review_id`.")
+}
+
+```
+
+## 4) Get a fresh, lightweight table (no progress)
+
+We scrape just the shelves table to see what’s new/changed.
+
+```{r}
+current_tbls <- lapply(shelves_to_check, function(sh) {
+  message(">> Scraping shelf table: ", sh)
+  scrape_shelf_table(sh, max_pages = 50, sleep_sec = 1)
+})
+current <- bind_rows(current_tbls)
+
+current <- current %>%
+  mutate(review_id = extract_review_id(view)) %>%
+  filter(!is.na(review_id)) %>%
+  distinct(review_id, .keep_all = TRUE)
+
+```
+
+## 5 Decide what to scrape (new or “needs refresh”)
+
+New books: in `current` but not in `old` by `review_id`.
+Refresh candidates (optional but recommended): items you might still be 
+reading (no `date_finished`) or with shelf indicating `currently-reading`, 
+or where key columns changed vs. the old snapshot.
+
+```{r}
+
+old_keys <- old %>% filter(!is.na(review_id)) %>% pull(review_id)
+
+new_ids <- setdiff(current$review_id, old_keys)
+new_rows <- current %>% filter(review_id %in% new_ids)
+
+# Detect changed rows: compare a few columns (date_* , my_rating, shelves)
+cols_to_compare <- intersect(
+  c("date_started", "date_finished", "my_rating", "shelves"),
+  intersect(names(old), names(current))
+)
+
+# Wide join current vs old on review_id
+comp_tbl <- current %>%
+  select(review_id, all_of(cols_to_compare)) %>%
+  left_join(
+    old %>% select(review_id, all_of(cols_to_compare)),
+    by = "review_id",
+    suffix = c("", "_old")
+  )
+
+# For each row, mark TRUE if ANY of the comparison columns changed
+changed_flag <- rep(FALSE, nrow(comp_tbl))
+
+for (col in cols_to_compare) {
+  new_col <- comp_tbl[[col]]
+  old_col <- comp_tbl[[paste0(col, "_old")]]
+  
+  # changed if (not both NA) AND (values differ)
+  changed_here <- !(is.na(new_col) & is.na(old_col)) & (new_col != old_col)
+  changed_flag <- changed_flag | (changed_here %in% TRUE)
+}
+
+changed_ids <- comp_tbl$review_id[changed_flag]
+
+changed_rows <- current %>%
+  filter(review_id %in% changed_ids)
+
+# Books likely in progress (no finish date)
+in_progress <- current %>%
+  filter(
+    is.na(date_finished),
+    as.Date(date_added, "%b %d 20%y") < as.Date("Jan 01, 2020", "%b %d 20%y")
+    )
+
+to_refresh <- bind_rows(changed_rows, in_progress) %>%
+  distinct(review_id, .keep_all = TRUE)
+
+targets <- bind_rows(new_rows, to_refresh) %>%
+  distinct(review_id, .keep_all = TRUE)
+
+message(sprintf("New: %d | Refresh: %d | Total targets: %d",
+                nrow(new_rows), nrow(to_refresh), nrow(targets)))
+```
+
+
+## 6 Scrape progress only for targets
+
+```{r}
+
+safe_progress <- purrr::possibly(
+  scrape_reading_progress,
+  otherwise = tibble::tibble(
+    date       = as.Date(character()),
+    page       = integer(),
+    percent    = numeric(),
+    event      = character(),
+    status_url = character()
+  ),
+  quiet = TRUE
+)
+
+n_tgt <- nrow(targets)
+
+message(paste(
+  ">> Scraping progress + metadata for targets. You have",
+  n_tgt,
+  "books. Roughly",
+  n_tgt * 3 / 60,
+  "minutes for progress, plus metadata."
+))
+
+pb <- utils::txtProgressBar(min = 0, max = n_tgt, style = 3)
+i  <- 0L
+
+targets_with_prog <- targets %>%
+  mutate(
+    .combined = purrr::map2(view, book_url, ~{
+      i <<- i + 1L
+      if (i %% 10L == 0L) {
+        message(sprintf("[%d/%d] (%.1f%%)", i, n_tgt, 100 * i / n_tgt))
+      }
+      utils::setTxtProgressBar(pb, i)
+
+      list(
+        progress = safe_progress(.x),
+        meta     = get_meta_cached(..2)
+      )
+    })
+  ) %>%
+  mutate(
+    progress      = purrr::map(.combined, "progress"),
+    metadata      = purrr::map(.combined, "meta"),
+    progress_json = purrr::map_chr(progress, format_progress_json),
+    genres_vec    = purrr::map(metadata, ~ .x$genres_vec %||% character()),
+    genres        = purrr::map_chr(metadata, ~ .x$genres     %||% NA_character_),
+    language      = purrr::map_chr(metadata, ~ .x$language   %||% NA_character_)
+  ) %>%
+  select(-.combined)
+
+close(pb)
+message(">> Finished scraping progress + metadata for targets")
+
+```
+
+
+## 7 Merge with old master (upsert by review_id)
+
+We keep old rows for everything not in targets. For targets, we take the fresh 
+version (including updated `progress_json` and updated columns from 
+the new snapshot).
+
+```{r}
+# Columns we want to carry forward; keep `review_id`, `view` for future updates
+keep_cols <- c(
+  "review_id",
+  "view",
+  "title",
+  "author",
+  "book_url",
+  "date_pub",
+  "date_finished",
+  "date_started",
+  "num_pages",
+  "my_rating",
+  "review",
+  "shelves",
+  "progress_json",
+  "genres",
+  "language"
+)
+
+# helper: ensure all keep_cols exist (fill missing with NA)
+ensure_cols <- function(df, cols) {
+  for (nm in cols) {
+    if (!nm %in% names(df)) {
+      df[[nm]] <- NA
+    }
+  }
+  df
+}
+
+# Harmonize columns between old and new
+old_h <- old %>%
+  mutate(review_id = as.character(review_id)) %>%
+  ensure_cols(keep_cols) %>%     # <-- will now create `genres` and `language`
+  select(all_of(keep_cols)) %>%
+  distinct(review_id, .keep_all = TRUE)
+
+new_h <- targets_with_prog %>%
+  mutate(review_id = as.character(review_id)) %>%
+  select(any_of(keep_cols)) %>%
+  distinct(review_id, .keep_all = TRUE)
+
+updated <- old_h %>%
+  anti_join(new_h %>% select(review_id), by = "review_id") %>%
+  bind_rows(new_h) %>%
+  distinct(review_id, .keep_all = TRUE)
+```
+
+### 7.5 Let's test it
+That should print languages and genres
+```{r}
+test_subset <- current %>%
+  slice_head(n = 5) %>%
+  mutate(meta = map(book_url, safe_metadata)) %>%
+  mutate(
+    genres   = map_chr(meta, "genres"),
+    language = map_chr(meta, "language")
+  ) %>%
+  select(title, language, genres)
+
+print(test_subset)
+```
+
+## 8 Save updated master
+```{r}
+dir.create("output", showWarnings = FALSE)
+
+# Overwrite the lightweight master used by this updater
+readr::write_csv(updated, master_path)
+
+# Also write a dated snapshot (optional)
+dated <- file.path(
+  "output",
+  sprintf("goodreads_progress_logs_incremental_%s.csv",
+          format(Sys.Date(), "%Y%m%d"))
+)
+readr::write_csv(updated, dated)
+
+message("✅ Updated master saved at:\n- ", normalizePath(master_path),
+        "\n- ", normalizePath(dated))
+
+```
+
+## 9 Close session
+
+```{r}
+safe_onexit(remDr$close())
+safe_onexit(rD$server$stop())
+
+```

@@ -1,0 +1,6 @@
+"0","if (!file.exists(master_path)) {"
+"0","  stop(""Master file not found: "", master_path,"
+"0","       ""\nRun the full scraper once before using the updater."")"
+"0","}"
+"0",""
+"0","old <- readr::read_csv(master_path, show_col_types = FALSE)"

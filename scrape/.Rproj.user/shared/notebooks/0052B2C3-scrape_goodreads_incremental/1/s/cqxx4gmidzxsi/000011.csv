@@ -1,0 +1,10 @@
+"0","changed_rows <- current %>%
+  select(review_id, all_of(cols_to_compare)) %>%
+  pivot_longer(-review_id, names_to = ""col"", values_to = ""new"") 
+"
+"1","[1m[33mError[39m in `pivot_longer()`:[22m
+[33m![39m Can't combine `date_started` <character> and `my_rating` <integer>.
+Backtrace:
+[90m 1. [39m... %>% ...
+[90m 3. [39m[1m[94mtidyr:::pivot_longer.data.frame([39m[22m., -review_id, names_to = ""col"", values_to = ""new""[1m[94m)[39m[22m
+"

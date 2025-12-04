@@ -1,0 +1,4 @@
+"0","extract_review_id <- function(x) {"
+"0","  id <- stringr::str_extract(x %||% """", ""(?<=/review/show/)\\d+"")"
+"0","  suppressWarnings(as.character(id))"
+"0","}"

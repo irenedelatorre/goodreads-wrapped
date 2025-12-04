@@ -1,0 +1,497 @@
+---
+title: "Scrape Goodreads for the first time"
+author: "Irene de la Torre Arenas"
+date: "2025-09-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R script that extracts your Goodreads library
+
+Script created using ChatGPT.
+
+Script that extract your Goodreads library 
+including “Date started” and “Date finished” from your “My Books” view (not
+from the official CSV), while logged in. It uses RSelenium to open a real
+Firefox browser so you can log in (even if your library is not public).
+
+### How it works:
+
+1) Opens Firefox with RSelenium
+2) Navigates to Goodreads so you can log in
+3) Iterates through your shelves (“read”, “currently-reading”, and “to-read”) in
+table view with per_page=100, scrapes the visible table (which usually includes
+“Date Started” and “Date Read/Finished” if you have them saved)
+4) Combines everything and exports a CSV with title, author, date_started,
+date_finished, etc.
+
+Prerequisites (one time):
+Make sure you have Firefox installed. If RSelenium fails to start due to
+version mismatches, check the comment inside the script.
+
+```{r}
+# install.packages(c(
+#   "RSelenium",
+#   "rvest",
+#   "xml2",
+#   "dplyr",
+#   "purrr",
+#   "stringr",
+#   "readr",
+#   "lubridate",
+#   "tidyr",
+#   "binman",
+#   "wdman"
+#   ))
+
+suppressPackageStartupMessages({
+  library(RSelenium)
+  library(rvest)
+  library(xml2)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(readr)
+  library(lubridate)
+  library(tidyr)
+  library(jsonlite)
+  library(tibble)
+})
+```
+
+## 0) Set up functions
+To avoid errors if the session is already closed.
+
+```{r}
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+safe_onexit <- function(expr) {
+  try(expr, silent = TRUE)
+}
+```
+
+## 1) Start Selenium (Firefox)
+
+```{r}
+
+message(">> Starting Selenium (Firefox)...")
+
+# change port number if the Selenium seems to be running even if the session 
+# was closed
+port <- as.integer(4569)
+
+rD <- rsDriver(
+  browser    = "firefox",
+  geckover   = "latest", # if this causes issues, use a fixed version: "0.35.0"
+  phantomver = NULL,
+  check      = FALSE,
+  verbose    = FALSE,
+  port       = port,    # use another free port
+)
+remDr <- rD$client
+remDr$open()
+
+# Safe shutdown even if the script fails later
+on.exit({
+  message("\n>> Closing session and Selenium server...")
+  safe_onexit(remDr$close())
+  safe_onexit(rD$server$stop())
+}, add = TRUE)
+
+# Navigation helpers
+go <- function(u) {
+  stopifnot(is.character(u), length(u) == 1L, !is.na(u), nzchar(trimws(u)))
+  remDr$navigate(trimws(u))
+}
+
+retry_nav <- function(u, attempts = 3, wait = 2) {
+  for (i in seq_len(attempts)) {
+    ok <- try({ go(u); TRUE }, silent = TRUE)
+    if (isTRUE(ok)) return(invisible(TRUE))
+    Sys.sleep(wait)
+  }
+  stop("Could not navigate to: ", u)
+}
+
+```
+
+## 2) Login manual
+
+```{r}
+
+login_url <- "https://www.goodreads.com/user/sign_in"
+n_books <- 100 #number of books in each page
+mybooks_url <- paste0(
+  "https://www.goodreads.com/review/list?view=table&per_page=",
+  n_books,
+  "&shelf=all"
+)
+
+retry_nav(login_url)
+```
+
+Log in to Goodreads in the Firefox window (username/password or SSO). 
+Once you’re logged in, the script will automatically detect it...
+
+```{r}
+# Quick check: go to My Books (table view, 100 per page)
+wait_until_logged_in <- function(timeout = 300, poll = 3) {
+  t0 <- Sys.time()
+  repeat {
+    # try going to My Books (if you’re not logged in, it redirects to sign_in)
+    retry_nav(mybooks_url)
+    Sys.sleep(2)
+    
+    # check current URL
+    curr <- try(remDr$getCurrentUrl()[[1]], silent = TRUE)
+    if (!inherits(curr, "try-error")) {
+      # if it does NOT contain "sign_in", you’re probably logged in
+      not_signin <- !grepl("sign_in", curr, fixed = TRUE)
+    } else {
+      not_signin <- FALSE
+    }
+    
+    # check if the page has a table
+    src <- try(remDr$getPageSource()[[1]], silent = TRUE)
+    has_table <- FALSE
+    if (!inherits(src, "try-error")) {
+      html <- xml2::read_html(src)
+      has_table <- length(rvest::html_elements(html, "table")) > 0
+    }
+    
+    if (isTRUE(not_signin) && isTRUE(has_table)) {
+      message("✔️ Login detected. Continuing.")
+      break
+    }
+    
+    if (as.numeric(difftime(Sys.time(), t0, units = "secs")) > timeout) {
+      stop("Login was not detected within the expected time (", timeout, " s).")
+    }
+    Sys.sleep(poll)
+  }
+}
+
+wait_until_logged_in(timeout = 300, poll = 3)
+Sys.sleep(2)  # small buffer
+
+```
+
+## 3) Scrape columns
+
+```{r}
+#Source scraping helpers (functions)
+# Loads function to normalize columns:
+# - `normalize_cols`
+# - `scrape_shelf_table`
+# - `parse_rating`
+# - `parse_gd_date`
+
+source("R/01_normalize_cols.R")
+
+# scrape_shelf_table ROBUST (auto-detection + wait + debug)
+# loads the following functions:
+# - `null_or_num`
+# - `null_or_str`
+# - `scrape_reading_progress`
+# - `format_progress_json`
+source("R/02_scrape_progress_per_book.R")
+
+# source metadata scraper
+# loads the following functions:
+# - clean_invisibles
+# - .lang_candidate_ok
+# - .extract_language
+# - scrape_book_metadata
+# - safe_metadata
+# - get_meta_cached
+source("R/03_scrape_book_metadata.R")
+```
+
+Scrapping read books -- it'll take a while to do
+
+```{r}
+message(">> Scrapping read books")
+df_read <- scrape_shelf_table("read")
+message(">> Finished scrapping")
+
+# get reading or waiting to be read books too
+
+# message(">> Raspando 'currently-reading' (en lectura)...")
+# df_current <- scrape_shelf_table("currently-reading")
+# 
+# message(">> Raspando 'to-read' (por leer)...")
+# df_toread  <- scrape_shelf_table("to-read")
+
+```
+
+## 5 Consolidate columns and get progress information of reading pace
+
+```{r}
+# Progress for scraping reading progress (or genres/language)
+n <- nrow(df_read)
+pb <- utils::txtProgressBar(min = 0, max = n, style = 3)
+i <- 0L
+
+# Use df_read (or the consolidated DF you have with the 'view' column)
+# It’s a good idea to wrap with `possibly()` in case any page fails.
+safe_progress <- purrr::possibly(
+  scrape_reading_progress,
+  otherwise = tibble::tibble(
+    date       = as.Date(character()),
+    page       = integer(),
+    percent    = numeric(),
+    event      = character(),
+    status_url = character()
+  ),
+  quiet = TRUE
+)
+
+message("starting to scrape progress, it'll take a while")
+df_read_with_progress <- df_read %>%
+   dplyr::mutate(progress = purrr::map(view, ~{
+    i <<- i + 1L
+    if (i %% 10L == 0L) {
+      # optional status line every 10 items
+      message(sprintf("[%d/%d] (%.1f%%)", i, n, 100 * i / n))
+    }
+    utils::setTxtProgressBar(pb, i)
+    safe_progress(.x)
+  })) %>%
+  dplyr::mutate(progress_json = purrr::map_chr(progress, format_progress_json))
+close(pb)
+message("finished scrapping")
+```
+
+## 6 Scrape book metatada: genres and languages. 
+
+Information included in the `book_url` column
+
+```{r}
+
+# check that the scrape worls (it takes a r)
+# purrr::walk(head(df_read$book_url, 3), test_book_metadata)
+
+## ONLY FOR DEBUGGING
+debug_language <- function(book_url) {
+  library(xml2); library(rvest); library(stringr)
+
+  cat("\nTesting:", book_url, "\n")
+
+  html <- tryCatch(read_html(book_url), error = function(e) NULL)
+  if (is.null(html)) {
+    retry_nav(book_url); Sys.sleep(1)
+    src <- remDr$getPageSource()[[1]]
+    html <- read_html(src)
+    cat("Used Selenium fallback\n")
+  }
+
+  n_desc_items <- length(rvest::html_elements(
+    html, xpath = "//dl[contains(@class,'DescList')]//div[contains(@class,'DescListItem')]"
+  ))
+  n_dt <- length(rvest::html_elements(html, xpath = "//dl[contains(@class,'DescList')]//dt"))
+  cat("DescList items:", n_desc_items, "| dt in DescList:", n_dt, "\n")
+
+  labs <- rvest::html_elements(
+    html, xpath = "//dl[contains(@class,'DescList')]//dt"
+  ) |>
+    rvest::html_text2() |>
+    stringr::str_squish()
+  if (length(labs)) {
+    cat("Labels under DescList:", paste(head(labs, 10), collapse = " | "), "\n")
+  }
+
+  # Quick extraction using the same logic as above, condensed
+  lang_labels <- c("Language","Idioma","Língua","Langue","Sprache","Lingua")
+  lang_node <- rvest::html_element(
+    html,
+    xpath = paste0(
+      "//dl[contains(@class,'DescList')]//div[contains(@class,'DescListItem')]",
+      "[.//dt[normalize-space() = '",
+      paste(lang_labels, collapse = "' or normalize-space() = '"),
+      "']]"
+    )
+  )
+  if (!is.null(lang_node)) {
+    val <- rvest::html_elements(
+      lang_node, xpath = ".//dd//*[(@data-testid='contentContainer') or self::dd]"
+    ) |>
+      rvest::html_text2() |>
+      stringr::str_squish()
+    val <- val[nzchar(val)]
+    cat("Language value:", if (length(val)) val[[1]] else "<none>", "\n")
+  } else {
+    cat("Language block not found in DescList. Will rely on generic/legacy fallback.\n")
+  }
+
+  invisible(TRUE)
+}
+
+
+
+test_url <- "https://www.goodreads.com/book/show/53138095-a-court-of-silver-flames"
+res <- scrape_book_metadata(test_url)
+str(res)
+```
+
+
+```{r}
+
+message(">> Started scraping metadata (genres + language)")
+
+# This is going to take a while
+# 📉 15 seconds/book
+# 📉 From 200 books = 50 seconds → 2–10 minutes
+
+# Optional cache to avoid re-scraping the same URL in a single run
+if (!exists(".meta_cache", inherits = FALSE)) {
+  .meta_cache <- new.env(parent = emptyenv())
+}
+
+n <- nrow(df_read_with_progress)
+
+message(paste(
+  "This is going to take a while, you have",
+  n,
+  "books. That's around",
+  n * 15 / 60,
+  "minutes maximum (very rough estimate)."
+))
+
+pb <- utils::txtProgressBar(min = 0, max = n, style = 3)
+i  <- 0L
+
+df_with_meta <- df_read_with_progress %>%
+  dplyr::mutate(
+    .meta = purrr::map(book_url, ~{
+      i <<- i + 1L
+      if (i %% 10L == 0L) {
+        message(sprintf("[%d/%d] (%.1f%%)", i, n, 100 * i / n))
+      }
+      utils::setTxtProgressBar(pb, i)
+      get_meta_cached(.x)
+    })
+  ) %>%
+  dplyr::mutate(
+    genres_vec = purrr::map(.meta, ~ .x$genres_vec %||% character()),
+    genres     = purrr::map_chr(.meta, ~ .x$genres     %||% NA_character_),
+    language   = purrr::map_chr(.meta, ~ .x$language   %||% NA_character_)
+  ) %>%
+  dplyr::select(-.meta)
+
+close(pb)
+
+message(">> Finished scraping metadata (genres + language)")
+
+```
+## 7 Export
+
+```{r}
+readr::write_csv(
+  df_with_meta %>%
+    select(
+      title,
+      author,
+      book_url,
+      date_pub,
+      date_finished,
+      date_started,
+      num_pages,
+      my_rating,
+      review,
+      shelves,
+      progress_json,
+      genres,
+      language
+    ),
+  "output/goodreads_progress_logs.csv"
+)
+```
+
+
+## 7 Unite all data frames
+
+```{r}
+
+all_df <- bind_rows(
+  df_read_with_progress,
+  # df_current,
+  # df_toread
+  ) %>%
+  select(any_of(c(
+    "title",
+    "author",
+    "book_url",
+    "date_pub",
+    "date_finished",
+    "date_started",
+    "num_pages",
+    "my_rating",
+    "review",
+    "shelves",
+    "progress_json"
+    )),
+    everything()
+    ) %>%
+  distinct()
+
+if ("date_started" %in% names(all_df)) {
+  all_df$date_started_parsed <- parse_gd_date(all_df$date_started)
+}
+if ("date_finished" %in% names(all_df)) {
+  all_df$date_finished_parsed <- parse_gd_date(all_df$date_finished)
+}
+
+final_df <- all_df %>%
+  filter(!(is.na(title) & is.na(author))) %>%
+  arrange(desc(coalesce(date_finished_parsed, date_started_parsed))) %>%
+  relocate(
+    title,
+    author,
+    book_url,
+    date_pub,
+    date_finished,
+    date_started,
+    num_pages,
+    my_rating,
+    review,
+    shelves,
+    progress_json
+  ) %>%
+  select((c(
+    title,
+    author,
+    book_url,
+    date_pub,
+    date_finished_parsed,
+    date_started_parsed,
+    num_pages,
+    my_rating,
+    review,
+    shelves,
+    progress_json
+  )))
+```
+
+## 8 Export all books
+
+```{r}
+outfile <- file.path(
+  getwd(),
+  sprintf(
+    "output/goodreads_with_dates_%s.csv",
+    format(Sys.Date(), "%Y%m%d")
+    ))
+write_csv(final_df, outfile)
+message(sprintf("\n✅ ¡Listo! Exportado a: %s", outfile))
+```
+
+## 9 Close session
+
+```{r}
+safe_onexit(remDr$close())
+safe_onexit(rD$server$stop())
+
+```
