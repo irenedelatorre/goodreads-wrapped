@@ -416,7 +416,7 @@ readr::write_csv(
 ```{r}
 
 all_df <- bind_rows(
-  df_read_with_progress,
+  df_with_meta,
   # df_current,
   # df_toread
   ) %>%
@@ -431,7 +431,9 @@ all_df <- bind_rows(
     "my_rating",
     "review",
     "shelves",
-    "progress_json"
+    "progress_json",
+    "genres",
+    "language"
     )),
     everything()
     ) %>%
@@ -458,6 +460,8 @@ final_df <- all_df %>%
     my_rating,
     review,
     shelves,
+    genres,
+    language,
     progress_json
   ) %>%
   select((c(
@@ -471,6 +475,8 @@ final_df <- all_df %>%
     my_rating,
     review,
     shelves,
+    genres,
+    language,
     progress_json
   )))
 ```
